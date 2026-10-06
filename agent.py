@@ -31,7 +31,7 @@ load_dotenv()
 
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 EMBEDDING_DIM = 768
-DEFAULT_CHAT_MODEL = "gemini-2.0-flash"
+DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
 
 SERVICES_HEALTH: dict[str, str] = {
     "auth": "Status: DEGRADED. Error rate: 14.2% (HTTP 504). Redis session store latency: 4200ms. CPU: 45%.",
@@ -207,11 +207,21 @@ def create_agent_graph(
 
     if llm is None:
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        base_llm = ChatGoogleGenerativeAI(
+        primary_llm = ChatGoogleGenerativeAI(
             model=DEFAULT_CHAT_MODEL,
             google_api_key=api_key,
             temperature=0.0,
+            timeout=30,
+            max_retries=1,
         )
+        fallback_llm = ChatGoogleGenerativeAI(
+            model="gemini-flash-lite-latest",
+            google_api_key=api_key,
+            temperature=0.0,
+            timeout=30,
+            max_retries=1,
+        )
+        base_llm = primary_llm.with_fallbacks([fallback_llm])
         model = base_llm.bind_tools(tools)
     elif hasattr(llm, "bind_tools") and not hasattr(llm, "_mock_return_value"):
         model = llm.bind_tools(tools)
@@ -343,3 +353,4 @@ def reject_escalation(
     result = app.invoke(None, config)
     last_msg = result["messages"][-1]
     return {"status": "REJECTED_AND_RESUMED", "response": extract_text(last_msg.content)}
+

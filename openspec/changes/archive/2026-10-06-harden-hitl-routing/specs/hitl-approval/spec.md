@@ -1,9 +1,6 @@
-# hitl-approval Specification
+# Delta for hitl-approval
 
-## Purpose
-TBD - created by archiving change hitl-approval. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Sensitive actions require human approval
 The agent MUST pause before executing a model message if ANY of its tool calls is sensitive,
@@ -46,17 +43,3 @@ and MUST NOT execute any sensitive tool without explicit approval for that threa
 - WHEN an engineer rejects
 - THEN each sensitive tool call receives a ToolMessage with the rejection reason
 - AND no sensitive tool executes
-
-### Requirement: Pending escalation is inspectable
-The system SHALL expose get_pending_escalation(thread_id) returning the pending tool
-call name and arguments when a thread is awaiting approval, or None otherwise.
-
-#### Scenario: Pending escalation returns details
-- GIVEN a thread paused before sensitive_tools
-- WHEN get_pending_escalation is called with that thread_id
-- THEN it returns a dict with tool_name and parameters fields
-
-#### Scenario: No pending escalation returns None
-- GIVEN a thread that has completed without escalation
-- WHEN get_pending_escalation is called
-- THEN it returns None
