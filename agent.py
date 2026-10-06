@@ -1,4 +1,8 @@
-"""agent.py — Core Autonomous Incident Triage Agent with safe read-only tools."""
+"""agent.py — Autonomous Incident Triage Agent with HITL escalation gate.
+
+Safe tools run without interruption.
+Sensitive tools (escalate_ticket) are gated behind a human-approval interrupt.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -22,10 +27,11 @@ from psycopg_pool import ConnectionPool
 
 load_dotenv()
 
-# Constants
-EMBEDDING_MODEL = "models/text-embedding-004"
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 EMBEDDING_DIM = 768
-DEFAULT_CHAT_MODEL = "gemini-1.5-flash"
+DEFAULT_CHAT_MODEL = "gemini-2.0-flash"
 
 SERVICES_HEALTH: dict[str, str] = {
     "auth": "Status: DEGRADED. Error rate: 14.2% (HTTP 504). Redis session store latency: 4200ms. CPU: 45%.",
@@ -37,8 +43,16 @@ SYSTEM_PROMPT = (
     "You are an autonomous incident triage agent. When an incident is reported, you must "
     "ALWAYS inspect service health using `query_service_health` before searching for remediation "
     "runbooks using `search_remediation_runbooks`. Synthesize your findings and provide clear "
-    "diagnostic and remediation recommendations."
+    "diagnostic and remediation recommendations. "
+    "If manual intervention is required or a service remains DEGRADED after runbook steps, "
+    "you MUST call `escalate_ticket` to open a support ticket — but this will require "
+    "engineer approval before it executes."
 )
+
+SENSITIVE_TOOL_NAMES: set[str] = {"escalate_ticket"}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def extract_text(content: Any) -> str:
@@ -58,6 +72,9 @@ def extract_text(content: Any) -> str:
     return str(content)
 
 
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
+
 @tool
 def query_service_health(service: str) -> str:
     """Check the real-time health and diagnostic metrics for a specific service (e.g. 'auth', 'database', 'payments')."""
@@ -75,6 +92,7 @@ def get_connection_pool(database_url: str | None = None) -> ConnectionPool:
     """Return a shared ConnectionPool configured for Supabase transaction pooler."""
     global _global_pool
     if _global_pool is None:
+        import atexit
         url = database_url or os.environ.get("DATABASE_URL", "")
         pool_kwargs = {
             "prepare_threshold": None,  # Required for Supabase transaction pooler
@@ -87,6 +105,7 @@ def get_connection_pool(database_url: str | None = None) -> ConnectionPool:
             max_size=10,
             kwargs=pool_kwargs,
         )
+        atexit.register(_global_pool.close)
     return _global_pool
 
 
@@ -104,7 +123,6 @@ def search_runbooks_in_db(
             task_type="RETRIEVAL_QUERY",
         )
 
-    # Embed query
     query_vector = embeddings_client.embed_query(query, output_dimensionality=EMBEDDING_DIM)
 
     if pool is None:
@@ -137,9 +155,25 @@ def search_remediation_runbooks(query: str) -> str:
     return search_runbooks_in_db(query)
 
 
+@tool
+def escalate_ticket(ticket_title: str, severity: str) -> str:
+    """
+    SENSITIVE: Open a support ticket and page the on-call team.
+    Requires engineer approval before execution.
+    severity should be one of: low, medium, high, critical.
+    """
+    ticket_id = f"INC-{abs(hash(ticket_title)) % 10000:04d}"
+    return (
+        f"Ticket {ticket_id} created: '{ticket_title}' (severity={severity}). "
+        "On-call team has been paged."
+    )
+
+
 # ── LangGraph Agent ───────────────────────────────────────────────────────────
 
 SAFE_TOOLS = [query_service_health, search_remediation_runbooks]
+SENSITIVE_TOOLS = [escalate_ticket]
+ALL_TOOLS = SAFE_TOOLS + SENSITIVE_TOOLS
 
 
 class AgentState(TypedDict):
@@ -147,24 +181,29 @@ class AgentState(TypedDict):
 
 
 def route_tools(state: AgentState) -> str:
-    """Route to safe_tools if tool calls are present, otherwise END."""
+    """Route to sensitive_tools if any call is sensitive, safe_tools otherwise, or END."""
     messages = state["messages"]
     if not messages:
         return END
     last_message = messages[-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "safe_tools"
-    return END
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        return END
+    # If ANY tool call is sensitive, route to sensitive_tools (requires approval)
+    for tc in last_message.tool_calls:
+        if tc["name"] in SENSITIVE_TOOL_NAMES:
+            return "sensitive_tools"
+    return "safe_tools"
 
 
 def create_agent_graph(
     llm: Any = None,
     tools: Sequence[Any] | None = None,
     checkpointer: Any = None,
+    interrupt_before_sensitive: bool = True,
 ):
-    """Build and compile the LangGraph agent state graph."""
+    """Build and compile the LangGraph agent state graph with HITL interrupt."""
     if tools is None:
-        tools = SAFE_TOOLS
+        tools = ALL_TOOLS
 
     if llm is None:
         api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -188,23 +227,27 @@ def create_agent_graph(
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
-    builder.add_node("safe_tools", ToolNode(tools))
+    builder.add_node("safe_tools", ToolNode(SAFE_TOOLS))
+    builder.add_node("sensitive_tools", ToolNode(SENSITIVE_TOOLS))
 
     builder.add_edge(START, "agent")
     builder.add_conditional_edges(
         "agent",
         route_tools,
-        {"safe_tools": "safe_tools", END: END},
+        {"safe_tools": "safe_tools", "sensitive_tools": "sensitive_tools", END: END},
     )
     builder.add_edge("safe_tools", "agent")
+    builder.add_edge("sensitive_tools", "agent")
 
-    return builder.compile(checkpointer=checkpointer)
+    interrupt_nodes = ["sensitive_tools"] if interrupt_before_sensitive else []
+    return builder.compile(checkpointer=checkpointer, interrupt_before=interrupt_nodes)
 
 
 def get_agent_app(
     pool: ConnectionPool | None = None,
     checkpointer: Any = None,
     llm: Any = None,
+    interrupt_before_sensitive: bool = True,
 ):
     """Return the compiled LangGraph application with PostgresSaver checkpointer."""
     if checkpointer is None:
@@ -213,4 +256,90 @@ def get_agent_app(
         checkpointer = PostgresSaver(pool)
         checkpointer.setup()
 
-    return create_agent_graph(llm=llm, checkpointer=checkpointer)
+    return create_agent_graph(
+        llm=llm,
+        checkpointer=checkpointer,
+        interrupt_before_sensitive=interrupt_before_sensitive,
+    )
+
+
+# ── HITL helpers ──────────────────────────────────────────────────────────────
+
+
+def get_pending_escalation(
+    thread_id: str,
+    pool: ConnectionPool | None = None,
+) -> dict | None:
+    """
+    Return pending sensitive tool call details for a paused thread, or None.
+
+    Returns: {"tool_name": str, "parameters": dict, "tool_call_id": str} or None.
+    """
+    app = get_agent_app(pool=pool)
+    config = {"configurable": {"thread_id": thread_id}}
+    state = app.get_state(config)
+    if state is None or not state.values.get("messages"):
+        return None
+    last = state.values["messages"][-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return None
+    for tc in last.tool_calls:
+        if tc["name"] in SENSITIVE_TOOL_NAMES:
+            return {
+                "tool_name": tc["name"],
+                "parameters": tc["args"],
+                "tool_call_id": tc["id"],
+            }
+    return None
+
+
+def approve_escalation(
+    thread_id: str,
+    pool: ConnectionPool | None = None,
+) -> dict:
+    """Resume a paused thread, allowing the sensitive tool to execute."""
+    app = get_agent_app(pool=pool)
+    config = {"configurable": {"thread_id": thread_id}}
+    result = app.invoke(None, config)
+    last = result["messages"][-1]
+    return {"status": "RESOLVED", "response": extract_text(last.content)}
+
+
+def reject_escalation(
+    thread_id: str,
+    reason: str,
+    pool: ConnectionPool | None = None,
+) -> dict:
+    """
+    Inject a rejection ToolMessage for every pending sensitive call, then resume.
+    The agent receives the rejection reason and can continue reasoning.
+    """
+    app = get_agent_app(pool=pool)
+    config = {"configurable": {"thread_id": thread_id}}
+    state = app.get_state(config)
+
+    if state is None or not state.values.get("messages"):
+        return {"status": "ERROR", "response": "No state found for thread."}
+
+    last = state.values["messages"][-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return {"status": "ERROR", "response": "No pending tool calls."}
+
+    # Inject a ToolMessage rejection for every sensitive pending call
+    rejection_messages = []
+    for tc in last.tool_calls:
+        if tc["name"] in SENSITIVE_TOOL_NAMES:
+            rejection_messages.append(
+                ToolMessage(
+                    content=f"Rejected by engineer: {reason}",
+                    tool_call_id=tc["id"],
+                )
+            )
+
+    if not rejection_messages:
+        return {"status": "ERROR", "response": "No sensitive tool calls found."}
+
+    app.update_state(config, {"messages": rejection_messages}, as_node="sensitive_tools")
+    result = app.invoke(None, config)
+    last_msg = result["messages"][-1]
+    return {"status": "REJECTED_AND_RESUMED", "response": extract_text(last_msg.content)}

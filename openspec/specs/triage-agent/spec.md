@@ -51,3 +51,12 @@ The system SHALL normalise list-structured LLM message content into a plain stri
 - **GIVEN** an AIMessage where `content` is a list of dictionary blocks or strings
 - **WHEN** `extract_text` is called on the message content
 - **THEN** a single concatenated plain text string is returned
+
+### Requirement: Escalation instruction in system prompt
+The agent's system prompt SHALL instruct it to call escalate_ticket when manual
+intervention is needed or a service remains degraded after runbook steps.
+
+#### Scenario: Agent chooses to escalate on degraded service
+- GIVEN an incident where service health shows DEGRADED status
+- WHEN the agent has already searched runbooks and the issue persists
+- THEN the model emits an escalate_ticket tool call

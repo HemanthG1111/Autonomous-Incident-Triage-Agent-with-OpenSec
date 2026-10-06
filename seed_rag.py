@@ -17,7 +17,7 @@ from psycopg_pool import ConnectionPool
 
 load_dotenv()
 
-EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 EMBEDDING_DIM = 768
 
 # ── Runbooks ─────────────────────────────────────────────────────────────────
